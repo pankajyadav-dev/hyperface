@@ -6,9 +6,10 @@ bookings are made for a date + time slot. The system **prevents overlapping
 bookings**, enforces **room capacity**, supports **cancellation**, and offers an
 **availability check with suggested free slots**.
 
-Built as a single **Next.js 15 (App Router)** app, running on **Bun**, with
-**Prisma ORM** on **PostgreSQL**. Ships with a `Dockerfile` and
-`docker-compose.yml` (Postgres alpine).
+Built as **two separate apps**:
+
+- **`frontend/`** — a **React** single-page app (Vite + React Router).
+- **`backend/`** — an **Express** REST API using **Prisma ORM** on **PostgreSQL**.
 
 ---
 
@@ -18,50 +19,71 @@ Built as a single **Next.js 15 (App Router)** app, running on **Bun**, with
 docker compose up --build
 ```
 
-Then open **http://localhost:3000**.
+- Frontend: **http://localhost:5173**
+- Backend API: **http://localhost:4000**
 
-The app container automatically:
-
-1. waits for Postgres,
-2. runs `prisma migrate deploy` (creates the schema),
-3. seeds a few sample rooms/employees (only if the DB is empty),
-4. starts Next.js.
-
-Sample data lets you try it immediately: rooms Neptune/Saturn/Mercury/Jupiter/Pluto
-and three employees.
+The backend container automatically waits for Postgres, runs
+`prisma migrate deploy` (creates the schema), seeds a few sample
+rooms/employees (only if the DB is empty), then starts the API.
 
 ## Local dev (without Docker)
 
-Requires Bun and a running Postgres.
+Requires Node.js and a running Postgres.
+
+**Backend**
 
 ```bash
-bun install
+cd backend
+npm install
 cp .env.example .env          # edit DATABASE_URL if needed
-bunx prisma migrate deploy    # create schema
-bun prisma/seed.ts            # optional sample data
-bun run dev                   # http://localhost:3000
+npm run db:deploy             # create schema
+npm run db:seed               # optional sample data
+npm run dev                   # http://localhost:4000
+```
+
+**Frontend** (in a second terminal)
+
+```bash
+cd frontend
+npm install
+cp .env.example .env          # VITE_API_URL defaults to http://localhost:4000
+npm run dev                   # http://localhost:5173
 ```
 
 ---
 
 ## Pages
 
-| Page                 | What it does                                                        |
+| Route                | What it does                                                        |
 | -------------------- | ------------------------------------------------------------------- |
 | `/`                  | Dashboard with counts and shortcuts                                 |
 | `/book`              | Make a booking; **Check availability** shows conflicts + suggestions |
 | `/bookings`          | All bookings; filter by room/employee; **cancel** a booking         |
 | `/rooms`             | Register rooms; list grouped by floor                               |
-| `/rooms/[id]`        | Bookings for one room                                                |
+| `/rooms/:id`         | Bookings for one room                                                |
 | `/employees`         | Register employees; list                                            |
-| `/employees/[id]`    | Bookings by one employee                                             |
+| `/employees/:id`     | Bookings by one employee                                            |
+
+## API
+
+| Method | Endpoint                       | Purpose                              |
+| ------ | ------------------------------ | ------------------------------------ |
+| GET    | `/api/rooms`                   | List active rooms                    |
+| POST   | `/api/rooms`                   | Register a room                      |
+| GET    | `/api/rooms/:id`               | One room                             |
+| GET    | `/api/rooms/:id/bookings`      | Bookings for a room                  |
+| GET    | `/api/employees`               | List employees                      |
+| POST   | `/api/employees`               | Register an employee                 |
+| GET    | `/api/employees/:id`           | One employee                         |
+| GET    | `/api/employees/:id/bookings`  | Bookings by an employee              |
+| GET    | `/api/bookings?room=&employee=`| List/filter bookings                 |
+| POST   | `/api/bookings/check`          | Availability check (no write)        |
+| POST   | `/api/bookings`                | Create a booking                     |
+| POST   | `/api/bookings/:id/cancel`     | Cancel a booking                     |
 
 ---
 
 ## Data model (entities & relationships)
-
-Designed as it would sit in a real relational DB — surrogate keys, status
-columns instead of hard deletes, timestamps, and foreign keys.
 
 ```
 employees 1───∞ bookings ∞───1 rooms
@@ -78,12 +100,12 @@ timestamps. Room name is unique **per floor**.
 
 ### Integrity is enforced in the database, not just the app
 
-The Prisma schema (`prisma/schema.prisma`) defines the tables; the hand-written
-migration (`prisma/migrations/0001_init/migration.sql`) adds guarantees Prisma
-can't express on its own:
+The Prisma schema (`backend/prisma/schema.prisma`) defines the tables; the
+hand-written migration (`backend/prisma/migrations/0001_init/migration.sql`)
+adds guarantees Prisma can't express on its own:
 
 - **No double-booking** — a generated `tsrange` column `during` plus a GiST
-  **exclusion constraint** (`bookings_no_overlap`) makes it *impossible* for two
+  **exclusion constraint** (`bookings_no_overlap`) makes it impossible for two
   `booked` rows in the same room to overlap in time, even under concurrent
   requests. Cancelled rows are excluded, so cancelling instantly frees the slot.
 - **`end_time > start_time`**, **`capacity > 0`**, **`attendees > 0`** — CHECK
@@ -91,80 +113,63 @@ can't express on its own:
 - **Case-insensitive uniqueness** on employee email and on (floor, room name).
 - **`updated_at`** auto-maintained by a trigger.
 
-The app also checks conflicts *before* inserting so it can show a friendly
+The API also checks conflicts before inserting so it can show a friendly
 message + suggestions; the DB constraint is the final safety net for races.
-
-### Why it's future-upgradeable without big rewrites
-
-- Surrogate integer keys everywhere → relationships never break when labels change.
-- `status` enum + `cancelled_at` → we never delete history; new statuses (e.g.
-  `pending`, `checked_in`) are additive.
-- `is_active` on rooms → decommission a room without losing its bookings.
-- Real Prisma migrations (`schema_migrations` tracked) → the next change is just
-  a new migration file; no manual DB surgery.
-- Clean separation: `lib/queries.ts` (data), `lib/availability.ts` (rules),
-  `app/actions.ts` (validation) — easy to extend (recurring bookings, approvals,
-  auth) without touching the UI.
 
 ---
 
 ## Edge cases handled
 
-**Booking**
+**Booking** — start ≥ end rejected; attendees over capacity rejected with actual
+numbers; attendees < 1 or non-integer rejected; invalid date/time rejected;
+overlap (full, partial, envelope; touching-at-edge allowed via half-open
+ranges) rejected with clashing bookings and same-length slot suggestions;
+deleted room/employee rejected; concurrent same-slot race rejected by the DB
+exclusion constraint with a fresh conflict shown to the loser.
 
-- Start time equal to or after end time → rejected.
-- Attendees exceed room capacity → rejected with the actual numbers.
-- Attendees < 1 or non-integer → rejected.
-- Invalid/malformed date or time → rejected.
-- Overlapping an existing booking (full, partial, envelope, or touching-at-edge
-  is allowed since ranges are half-open `[start, end)`) → rejected with the list
-  of clashing bookings **and** suggested free slots of the same length.
-- Room or employee deleted/nonexistent between page load and submit → rejected.
-- Race: two people book the same slot simultaneously → DB exclusion constraint
-  rejects the loser, who is shown the fresh conflict + suggestions.
+**Cancellation** — nonexistent or already-cancelled booking gives a clear error;
+cancelling frees the slot immediately.
 
-**Cancellation**
+**Registration** — duplicate employee email (case-insensitive) rejected;
+duplicate room name on the same floor rejected (same name on another floor is
+fine); blank name / invalid email / non-integer floor or capacity rejected.
 
-- Cancelling a nonexistent booking → clear error.
-- Cancelling an already-cancelled booking → clear error (idempotent-safe).
-- Cancelling frees the slot immediately (constraint ignores cancelled rows).
-
-**Registration**
-
-- Duplicate employee email (case-insensitive) → rejected.
-- Duplicate room name on the same floor → rejected (same name on another floor
-  is fine).
-- Blank name / invalid email / non-integer floor or capacity → rejected.
-
-**Availability / suggestions**
-
-- Suggestions are computed within office hours (08:00–20:00), match the
-  requested duration, prefer a time at/after the requested start, and skip gaps
-  that are too small.
+**Availability** — suggestions computed within office hours (08:00–20:00), match
+the requested duration, prefer a time at/after the requested start, and skip
+gaps that are too small.
 
 ---
 
 ## Project structure
 
 ```
-prisma/
-  schema.prisma                 # models
-  migrations/0001_init/…        # tables + exclusion constraint + checks
-  seed.ts                       # idempotent sample data
-src/
-  lib/
-    prisma.ts                   # Prisma client singleton
-    queries.ts                  # all reads/writes via Prisma
-    availability.ts             # conflict detection + slot suggestions
-    time.ts                     # HH:MM math + Prisma date/time conversions
+backend/
+  prisma/
+    schema.prisma                 models
+    migrations/0001_init/…        tables + exclusion constraint + checks
+    seed.ts                       idempotent sample data
+  src/
+    prisma.ts                     Prisma client singleton
+    queries.ts                    reads/writes via Prisma
+    availability.ts               conflict detection + slot suggestions
+    time.ts                       HH:MM math + Prisma date/time conversions
+    validation.ts                 booking input validation
     types.ts
-  app/
-    actions.ts                  # server actions (all validation lives here)
-    page.tsx, book/, bookings/, rooms/, employees/
-  components/                   # forms, tables, cancel button, alerts
-Dockerfile, docker-compose.yml, docker-entrypoint.sh
+    server.ts                     Express app + REST routes
+  Dockerfile, docker-entrypoint.sh
+frontend/
+  src/
+    api.ts                        typed fetch client for the backend
+    types.ts
+    time.ts
+    App.tsx, main.tsx, styles.css
+    pages/                        one component per route
+    components/                   forms, tables, cancel button, alerts
+  Dockerfile, nginx.conf, vite.config.ts, index.html
+docker-compose.yml                db + backend + frontend
 ```
 
 ## Tech
 
-Next.js 15 · React 19 · Prisma 6 · PostgreSQL 16 (alpine) · Bun · TypeScript.
+React 19 · React Router 7 · Vite 6 · Express 4 · Prisma 6 · PostgreSQL 16
+(alpine) · TypeScript.
